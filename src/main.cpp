@@ -80,7 +80,7 @@ static void drawLine(int row, const char *label, float v, int digits, const char
   }
 }
 
-static void drawReading(const String &name, const RuuviV5 &r) {
+static void drawReading(const String &name, const RuuviV5 &r, int rssi) {
   tft.setTextSize(2);
   tft.setCursor(4, 4);
   tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
@@ -90,6 +90,8 @@ static void drawReading(const String &name, const RuuviV5 &r) {
   drawLine(2, "Hum:  ", r.humidityPct, 1, " %");
   drawLine(3, "Pres: ", r.pressureHPa, 1, " hPa");
   drawLine(4, "Batt: ", r.batteryV, 2, " V");
+  drawLine(5, "RSSI: ", (float)rssi, 0, " dBm");
+  drawLine(6, "Msg#: ", r.sequence < 0 ? NAN : (float)r.sequence, 0, "");
 }
 
 void setup() {
@@ -163,7 +165,7 @@ void loop() {
   // Redraw at most once per second to avoid flicker and SPI load.
   if (millis() - lastDraw >= 1000) {
     lastDraw = millis();
-    drawReading(dev.hasLocalName() ? dev.localName() : String("Ruuvi"), r);
+    drawReading(dev.hasLocalName() ? dev.localName() : String("Ruuvi"), r, dev.rssi());
   }
 
   printVal("Temperature", r.temperatureC, 2, " C");
