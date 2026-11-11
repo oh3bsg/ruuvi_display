@@ -66,32 +66,125 @@ static void printVal(const char *label, float v, int digits, const char *unit) {
 
 static Adafruit_ILI9341 tft(TFT_PIN_CS, TFT_PIN_DC, TFT_PIN_RST);
 static uint32_t lastDraw = 0;
+static bool screenInitialised = false;
 
-static void drawLine(int row, const char *label, float v, int digits, const char *unit) {
-  tft.setCursor(4, 4 + row * 30);
+// ---- Pressure trend ------------------------------------------------------
+// One sample every PRESSURE_SAMPLE_INTERVAL_MS, ring buffer of
+// PRESSURE_HISTORY_SIZE samples. Trend = newest - oldest sample.
+static float pHist[PRESSURE_HISTORY_SIZE];
+static int pCount = 0;
+static int pHead = 0;  // index of next write
+static uint32_t lastPSample = 0;
+
+static void updatePressureHistory(float p) {
+  if (isnan(p)) return;
+  if (pCount > 0 && millis() - lastPSample < PRESSURE_SAMPLE_INTERVAL_MS) return;
+  lastPSample = millis();
+  pHist[pHead] = p;
+  pHead = (pHead + 1) % PRESSURE_HISTORY_SIZE;
+  if (pCount < PRESSURE_HISTORY_SIZE) pCount++;
+}
+
+// Returns +1 rising, -1 falling, 0 steady, 2 not enough history yet.
+static int pressureTrend(float current) {
+  if (pCount < 2 || isnan(current)) return 2;
+  int oldest = (pHead - pCount + PRESSURE_HISTORY_SIZE) % PRESSURE_HISTORY_SIZE;
+  float d = current - pHist[oldest];
+  if (d >= PRESSURE_TREND_THRESHOLD_HPA) return 1;
+  if (d <= -PRESSURE_TREND_THRESHOLD_HPA) return -1;
+  return 0;
+}
+
+// ---- Drawing -------------------------------------------------------------
+// Clear from the current cursor to the right edge for a text row of height h.
+static void clearToEol(int h) {
+  int x = tft.getCursorX();
+  int y = tft.getCursorY();
+  if (x < tft.width()) tft.fillRect(x, y, tft.width() - x, h, ILI9341_BLACK);
+}
+
+// Small cell, 13 characters wide at size 2 (156 px), padded to overwrite old text.
+static void drawCell(int x, int y, const char *text) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%-13s", text);
+  tft.setTextSize(2);
   tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-  tft.print(label);
-  if (isnan(v)) {
-    tft.print("n/a      ");
-  } else {
-    tft.print(v, digits);
-    tft.print(unit);
-    tft.print("   ");  // overwrite leftovers from longer previous values
-  }
+  tft.setCursor(x, y);
+  tft.print(buf);
 }
 
 static void drawReading(const String &name, const RuuviV5 &r, int rssi) {
+  char buf[24];
+
+  if (!screenInitialised) {
+    screenInitialised = true;
+    tft.fillScreen(ILI9341_BLACK);
+    tft.drawFastHLine(0, 165, tft.width(), 0x528A);  // grey separator
+  }
+
+  // Tag name
   tft.setTextSize(2);
-  tft.setCursor(4, 4);
   tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
+  tft.setCursor(4, 4);
   tft.print(name);
-  tft.print("        ");
-  drawLine(1, "Temp: ", r.temperatureC, 2, " C");
-  drawLine(2, "Hum:  ", r.humidityPct, 1, " %");
-  drawLine(3, "Pres: ", r.pressureHPa, 1, " hPa");
-  drawLine(4, "Batt: ", r.batteryV, 2, " V");
-  drawLine(5, "RSSI: ", (float)rssi, 0, " dBm");
-  drawLine(6, "Msg#: ", r.sequence < 0 ? NAN : (float)r.sequence, 0, "");
+  clearToEol(16);
+
+  // Temperature, big. Degree sign is CP437 0xF8 (needs tft.cp437(true)).
+  tft.setCursor(4, 28);
+  uint16_t tempColor = ILI9341_WHITE;
+  if (!isnan(r.temperatureC)) {
+    if (r.temperatureC < TEMP_COLD_BELOW_C) tempColor = TEMP_COLD_COLOR;
+    else if (r.temperatureC > TEMP_HOT_ABOVE_C) tempColor = TEMP_HOT_COLOR;
+  }
+  tft.setTextColor(tempColor, ILI9341_BLACK);
+  if (isnan(r.temperatureC)) {
+    tft.setTextSize(8);
+    tft.print("n/a");
+    clearToEol(64);
+  } else {
+    tft.setTextSize(8);
+    tft.print(r.temperatureC, 1);
+    int x = tft.getCursorX();
+    tft.fillRect(x, 28, tft.width() - x, 64, ILI9341_BLACK);
+    tft.setTextSize(4);
+    tft.setCursor(x, 28);
+    tft.write((uint8_t)0xF8);
+    tft.print("C");
+  }
+
+  // Pressure, medium, followed by trend arrow (CP437 0x18 up, 0x19 down, 0x1A right).
+  tft.setTextSize(3);
+  tft.setTextColor(0x867F, ILI9341_BLACK);  // light blue
+  tft.setCursor(4, 116);
+  if (isnan(r.pressureHPa)) {
+    tft.print("n/a");
+  } else {
+    tft.print(r.pressureHPa, 1);
+    tft.print(" hPa ");
+    switch (pressureTrend(r.pressureHPa)) {
+      case 1:  tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);  tft.write((uint8_t)0x18); break;
+      case -1: tft.setTextColor(ILI9341_RED, ILI9341_BLACK);    tft.write((uint8_t)0x19); break;
+      case 0:  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);  tft.write((uint8_t)0x1A); break;
+      default: tft.setTextColor(0x528A, ILI9341_BLACK);         tft.print("-"); break;
+    }
+  }
+  clearToEol(24);
+
+  // Bottom rows, small
+  if (isnan(r.humidityPct)) snprintf(buf, sizeof(buf), "Hum: n/a");
+  else snprintf(buf, sizeof(buf), "Hum: %.1f %%", r.humidityPct);
+  drawCell(4, 180, buf);
+
+  if (isnan(r.batteryV)) snprintf(buf, sizeof(buf), "Batt: n/a");
+  else snprintf(buf, sizeof(buf), "Batt: %.2f V", r.batteryV);
+  drawCell(164, 180, buf);
+
+  snprintf(buf, sizeof(buf), "RSSI: %d dBm", rssi);
+  drawCell(4, 212, buf);
+
+  if (r.sequence < 0) snprintf(buf, sizeof(buf), "Msg#: n/a");
+  else snprintf(buf, sizeof(buf), "Msg#: %d", r.sequence);
+  drawCell(164, 212, buf);
 }
 
 void setup() {
@@ -114,6 +207,7 @@ void setup() {
   Serial.print("Power mode 0x0A: 0x");
   Serial.println(tft.readcommand8(ILI9341_RDMODE), HEX);
   tft.setRotation(1);  // landscape
+  tft.cp437(true);     // correct CP437 glyph indices (degree sign, arrows)
   tft.fillScreen(ILI9341_BLACK);
   tft.setTextSize(2);
   tft.setCursor(4, 4);
@@ -161,6 +255,8 @@ void loop() {
     Serial.println(len > 2 ? data[2] : 0, HEX);
     return;
   }
+
+  updatePressureHistory(r.pressureHPa);
 
   // Redraw at most once per second to avoid flicker and SPI load.
   if (millis() - lastDraw >= 1000) {
